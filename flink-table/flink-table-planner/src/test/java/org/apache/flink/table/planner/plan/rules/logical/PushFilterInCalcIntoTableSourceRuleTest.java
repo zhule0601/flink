@@ -34,15 +34,18 @@ import org.apache.calcite.plan.Convention;
 import org.apache.calcite.plan.hep.HepMatchOrder;
 import org.apache.calcite.rel.rules.CoreRules;
 import org.apache.calcite.tools.RuleSets;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import java.time.ZoneId;
 
 /** Test for {@link PushFilterInCalcIntoTableSourceRuleTest}. */
-public class PushFilterInCalcIntoTableSourceRuleTest
-        extends PushFilterIntoTableSourceScanRuleTestBase {
+class PushFilterInCalcIntoTableSourceRuleTest extends PushFilterIntoTableSourceScanRuleTestBase {
 
-    @Before
-    public void setup() {
+    @BeforeEach
+    void setup() {
         util = streamTestUtil(TableConfig.getDefault());
 
         FlinkChainedProgram<StreamOptimizeContext> program = new FlinkChainedProgram<>();
@@ -53,7 +56,7 @@ public class PushFilterInCalcIntoTableSourceRuleTest
                                 RuleSets.ofList(
                                         CoreRules.PROJECT_TO_CALC,
                                         CoreRules.FILTER_TO_CALC,
-                                        FlinkCalcMergeRule$.MODULE$.INSTANCE(),
+                                        FlinkCalcMergeRule.INSTANCE,
                                         FlinkLogicalCalc.CONVERTER(),
                                         FlinkLogicalTableSourceScan.CONVERTER(),
                                         FlinkLogicalWatermarkAssigner.CONVERTER()))
@@ -112,12 +115,67 @@ public class PushFilterInCalcIntoTableSourceRuleTest
     }
 
     @Test
-    public void testFailureToPushFilterIntoSourceWithoutWatermarkPushdown() {
+    void testFailureToPushFilterIntoSourceWithoutWatermarkPushdown() {
         util.verifyRelPlan("SELECT * FROM WithWatermark WHERE LOWER(name) = 'foo'");
     }
 
+    @ParameterizedTest(name = "virtual={0}")
+    @ValueSource(booleans = {false, true})
+    void testPredicateKindsOnWatermarkedTable(boolean virtual) {
+        // With a watermark, filters are pushed only after projection narrows the scan.
+        StreamTableTestUtil defaultUtil = streamTestUtil(TableConfig.getDefault());
+        defaultUtil
+                .tableEnv()
+                .executeSql(
+                        "CREATE TABLE T (\n"
+                                + "  a INT,\n"
+                                + "  b BIGINT,\n"
+                                + "  ts TIMESTAMP(3),\n"
+                                + "  "
+                                + (virtual ? "m1 INT METADATA VIRTUAL" : "m1 INT METADATA")
+                                + ",\n"
+                                + "  WATERMARK FOR ts AS ts - INTERVAL '1' SECOND\n"
+                                + ") WITH (\n"
+                                + "  'connector' = 'values',\n"
+                                + "  'bounded' = 'false',\n"
+                                + "  'disable-lookup' = 'true',\n"
+                                + "  'readable-metadata' = 'm1:INT',\n"
+                                + "  'filterable-fields' = 'a;m1',\n"
+                                + "  'enable-metadata-filter-push-down' = 'true',\n"
+                                + "  'enable-watermark-push-down' = 'true'\n"
+                                + ")");
+        defaultUtil.verifyRelPlan(
+                "SELECT a, m1 FROM T WHERE a > 1 AND m1 > 0 AND m1 > a AND (a < 5 OR m1 > 3)");
+    }
+
     @Test
-    public void testLowerUpperPushdown() {
+    void testPredicateKindsOnNestedFieldNamedLikeMetadataColumn() {
+        // Computed columns flatten r.k into the scan as r_k, clashing with the metadata column.
+        StreamTableTestUtil defaultUtil = streamTestUtil(TableConfig.getDefault());
+        defaultUtil
+                .tableEnv()
+                .executeSql(
+                        "CREATE TABLE TNested (\n"
+                                + "  r ROW<k INT, t TIMESTAMP(3)>,\n"
+                                + "  r_k INT METADATA FROM 'm0',\n"
+                                + "  k AS r.k,\n"
+                                + "  ts AS r.t,\n"
+                                + "  WATERMARK FOR ts AS ts - INTERVAL '1' SECOND\n"
+                                + ") WITH (\n"
+                                + "  'connector' = 'values',\n"
+                                + "  'bounded' = 'false',\n"
+                                + "  'disable-lookup' = 'true',\n"
+                                + "  'nested-projection-supported' = 'true',\n"
+                                + "  'readable-metadata' = 'm0:INT',\n"
+                                + "  'filterable-fields' = 'r_k;m0',\n"
+                                + "  'enable-metadata-filter-push-down' = 'true',\n"
+                                + "  'enable-watermark-push-down' = 'true'\n"
+                                + ")");
+        defaultUtil.verifyRelPlan("SELECT k, r_k FROM TNested WHERE k = 0 AND r_k > 5");
+    }
+
+    @Test
+    void testLowerUpperPushdown() {
         String ddl =
                 "CREATE TABLE MTable (\n"
                         + "  a STRING,\n"
@@ -132,7 +190,7 @@ public class PushFilterInCalcIntoTableSourceRuleTest
     }
 
     @Test
-    public void testWithInterval() {
+    void testWithInterval() {
         String ddl =
                 "CREATE TABLE MTable (\n"
                         + "a TIMESTAMP(3),\n"
@@ -146,5 +204,28 @@ public class PushFilterInCalcIntoTableSourceRuleTest
 
         util.tableEnv().executeSql(ddl);
         super.testWithInterval();
+    }
+
+    @Test
+    public void testWithTimestampWithTimeZone() {
+        String ddl =
+                "CREATE TABLE MTable (\n"
+                        + "a TIMESTAMP_LTZ(3),\n"
+                        + "b TIMESTAMP(3)\n"
+                        + ") WITH (\n"
+                        + " 'connector' = 'values',\n"
+                        + " 'bounded' = 'false',\n"
+                        + " 'filterable-fields' = 'a',\n"
+                        + " 'disable-lookup' = 'true'"
+                        + ")";
+
+        util.tableEnv().executeSql(ddl);
+        ZoneId preZoneId = util.tableEnv().getConfig().getLocalTimeZone();
+        util.tableEnv().getConfig().setLocalTimeZone(ZoneId.of("Asia/Shanghai"));
+        try {
+            super.testWithTimestampWithTimeZone();
+        } finally {
+            util.tableEnv().getConfig().setLocalTimeZone(preZoneId);
+        }
     }
 }

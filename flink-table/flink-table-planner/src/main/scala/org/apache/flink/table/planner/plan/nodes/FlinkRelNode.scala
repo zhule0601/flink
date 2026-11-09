@@ -15,12 +15,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.flink.table.planner.plan.nodes
 
+import org.apache.flink.table.planner.plan.utils.{ExpressionDetail, ExpressionFormat, FlinkRexUtil, RelDescriptionWriterImpl}
 import org.apache.flink.table.planner.plan.utils.ExpressionDetail.ExpressionDetail
 import org.apache.flink.table.planner.plan.utils.ExpressionFormat.ExpressionFormat
-import org.apache.flink.table.planner.plan.utils.{ExpressionDetail, ExpressionFormat, FlinkRexUtil, RelDescriptionWriterImpl}
 
 import org.apache.calcite.rel.RelNode
 import org.apache.calcite.rex._
@@ -28,19 +27,17 @@ import org.apache.calcite.sql.SqlExplainLevel
 
 import java.io.{PrintWriter, StringWriter}
 
-/**
-  * Base class for flink relational expression.
-  */
+/** Base class for flink relational expression. */
 trait FlinkRelNode extends RelNode {
 
   /**
-    * Returns a string which describes the detailed information of relational expression
-    * with attributes which contribute to the plan output.
-    *
-    * This method leverages [[RelNode#explain]] with
-    * [[org.apache.calcite.sql.SqlExplainLevel.EXPPLAN_ATTRIBUTES]] explain level to generate
-    * the description.
-    */
+   * Returns a string which describes the detailed information of relational expression with
+   * attributes which contribute to the plan output.
+   *
+   * This method leverages [[RelNode#explain]] with
+   * [[org.apache.calcite.sql.SqlExplainLevel.EXPPLAN_ATTRIBUTES]] explain level to generate the
+   * description.
+   */
   def getRelDetailedDescription: String = {
     val sw = new StringWriter
     val pw = new PrintWriter(sw)
@@ -52,7 +49,7 @@ trait FlinkRelNode extends RelNode {
   private[flink] def getExpressionString(
       expr: RexNode,
       inFields: List[String],
-      localExprsTable: Option[List[RexNode]],
+      localExprsTable: Option[IndexedSeq[RexNode]],
       sqlExplainLevel: SqlExplainLevel): String = {
     getExpressionString(expr, inFields, localExprsTable, ExpressionFormat.Prefix, sqlExplainLevel)
   }
@@ -60,7 +57,7 @@ trait FlinkRelNode extends RelNode {
   private[flink] def getExpressionString(
       expr: RexNode,
       inFields: List[String],
-      localExprsTable: Option[List[RexNode]],
+      localExprsTable: Option[IndexedSeq[RexNode]],
       expressionDetail: ExpressionDetail): String = {
     getExpressionString(expr, inFields, localExprsTable, ExpressionFormat.Prefix, expressionDetail)
   }
@@ -68,21 +65,29 @@ trait FlinkRelNode extends RelNode {
   private[flink] def getExpressionString(
       expr: RexNode,
       inFields: List[String],
-      localExprsTable: Option[List[RexNode]],
+      localExprsTable: Option[IndexedSeq[RexNode]],
       expressionFormat: ExpressionFormat,
       sqlExplainLevel: SqlExplainLevel): String = {
     getExpressionString(
-      expr, inFields, localExprsTable, expressionFormat, convertToExpressionDetail(sqlExplainLevel))
+      expr,
+      inFields,
+      localExprsTable,
+      expressionFormat,
+      convertToExpressionDetail(sqlExplainLevel))
   }
 
   private[flink] def getExpressionString(
       expr: RexNode,
       inFields: List[String],
-      localExprsTable: Option[List[RexNode]],
+      localExprsTable: Option[IndexedSeq[RexNode]],
       expressionFormat: ExpressionFormat,
       expressionDetail: ExpressionDetail): String = {
     FlinkRexUtil.getExpressionString(
-      expr, inFields, localExprsTable, expressionFormat, expressionDetail)
+      expr,
+      inFields,
+      localExprsTable,
+      expressionFormat,
+      expressionDetail)
   }
 
   private[flink] def convertToExpressionDetail(
@@ -93,6 +98,3 @@ trait FlinkRelNode extends RelNode {
     }
   }
 }
-
-
-

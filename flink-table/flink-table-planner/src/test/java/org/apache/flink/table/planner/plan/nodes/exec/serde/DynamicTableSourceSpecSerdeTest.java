@@ -30,6 +30,7 @@ import org.apache.flink.table.catalog.CatalogManager;
 import org.apache.flink.table.catalog.CatalogTable;
 import org.apache.flink.table.catalog.Column;
 import org.apache.flink.table.catalog.ContextResolvedTable;
+import org.apache.flink.table.catalog.DefaultIndex;
 import org.apache.flink.table.catalog.ObjectIdentifier;
 import org.apache.flink.table.catalog.ResolvedCatalogTable;
 import org.apache.flink.table.catalog.ResolvedSchema;
@@ -37,12 +38,15 @@ import org.apache.flink.table.factories.FactoryUtil;
 import org.apache.flink.table.factories.TestDynamicTableFactory;
 import org.apache.flink.table.factories.TestFormatFactory;
 import org.apache.flink.table.planner.calcite.FlinkTypeFactory;
+import org.apache.flink.table.planner.calcite.FlinkTypeSystem;
 import org.apache.flink.table.planner.factories.TestValuesTableFactory;
 import org.apache.flink.table.planner.plan.abilities.source.FilterPushDownSpec;
 import org.apache.flink.table.planner.plan.abilities.source.LimitPushDownSpec;
+import org.apache.flink.table.planner.plan.abilities.source.MetadataFilterPushDownSpec;
 import org.apache.flink.table.planner.plan.abilities.source.PartitionPushDownSpec;
 import org.apache.flink.table.planner.plan.abilities.source.ProjectPushDownSpec;
 import org.apache.flink.table.planner.plan.abilities.source.ReadingMetadataSpec;
+import org.apache.flink.table.planner.plan.abilities.source.SourceAbilitySpec;
 import org.apache.flink.table.planner.plan.abilities.source.SourceWatermarkSpec;
 import org.apache.flink.table.planner.plan.abilities.source.WatermarkPushDownSpec;
 import org.apache.flink.table.planner.plan.nodes.exec.spec.DynamicTableSourceSpec;
@@ -53,6 +57,8 @@ import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.TimestampKind;
 import org.apache.flink.table.types.logical.TimestampType;
+import org.apache.flink.table.watermark.WatermarkEmitStrategy;
+import org.apache.flink.table.watermark.WatermarkParams;
 
 import org.apache.calcite.avatica.util.TimeUnit;
 import org.apache.calcite.rex.RexBuilder;
@@ -60,6 +66,7 @@ import org.apache.calcite.sql.SqlIntervalQualifier;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.type.SqlTypeName;
+import org.apache.calcite.util.TimestampString;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.Execution;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -67,9 +74,11 @@ import org.junit.jupiter.params.provider.MethodSource;
 
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 
@@ -80,6 +89,7 @@ import static org.apache.flink.table.factories.FactoryUtil.FORMAT;
 import static org.apache.flink.table.factories.TestDynamicTableFactory.PASSWORD;
 import static org.apache.flink.table.factories.TestDynamicTableFactory.TARGET;
 import static org.apache.flink.table.factories.TestFormatFactory.DELIMITER;
+import static org.apache.flink.table.planner.plan.abilities.source.FilterPushDownSpec.FIELD_NAME_PREDICATES;
 import static org.apache.flink.table.planner.plan.nodes.exec.serde.JsonSerdeTestUtil.configuredSerdeContext;
 import static org.apache.flink.table.planner.plan.nodes.exec.serde.JsonSerdeTestUtil.toJson;
 import static org.apache.flink.table.planner.plan.nodes.exec.serde.JsonSerdeTestUtil.toObject;
@@ -100,14 +110,16 @@ public class DynamicTableSourceSpecSerdeTest {
                 new ResolvedSchema(
                         Collections.singletonList(Column.physical("a", DataTypes.BIGINT())),
                         Collections.emptyList(),
+                        null,
+                        Collections.singletonList(
+                                DefaultIndex.newIndex("idx", Collections.singletonList("a"))),
                         null);
 
         final CatalogTable catalogTable1 =
-                CatalogTable.of(
-                        Schema.newBuilder().fromResolvedSchema(resolvedSchema1).build(),
-                        null,
-                        Collections.emptyList(),
-                        options1);
+                CatalogTable.newBuilder()
+                        .schema(Schema.newBuilder().fromResolvedSchema(resolvedSchema1).build())
+                        .options(options1)
+                        .build();
 
         DynamicTableSourceSpec spec1 =
                 new DynamicTableSourceSpec(
@@ -138,16 +150,20 @@ public class DynamicTableSourceSpecSerdeTest {
                                 Column.metadata("m2", DataTypes.STRING(), null, false),
                                 Column.physical("ts", DataTypes.TIMESTAMP(3))),
                         Collections.emptyList(),
+                        null,
+                        Collections.singletonList(
+                                DefaultIndex.newIndex("idx", Collections.singletonList("a"))),
                         null);
 
         final CatalogTable catalogTable2 =
-                CatalogTable.of(
-                        Schema.newBuilder().fromResolvedSchema(resolvedSchema2).build(),
-                        null,
-                        Collections.emptyList(),
-                        options2);
+                CatalogTable.newBuilder()
+                        .schema(Schema.newBuilder().fromResolvedSchema(resolvedSchema2).build())
+                        .options(options2)
+                        .build();
 
-        FlinkTypeFactory factory = FlinkTypeFactory.INSTANCE();
+        FlinkTypeFactory factory =
+                new FlinkTypeFactory(
+                        Thread.currentThread().getContextClassLoader(), FlinkTypeSystem.INSTANCE);
         RexBuilder rexBuilder = new RexBuilder(factory);
         DynamicTableSourceSpec spec2 =
                 new DynamicTableSourceSpec(
@@ -204,13 +220,44 @@ public class DynamicTableSourceSpecSerdeTest {
                                                                 TimeUnit.SECOND,
                                                                 6,
                                                                 SqlParserPos.ZERO))),
+                                        null,
                                         5000,
                                         RowType.of(
                                                 new BigIntType(),
                                                 new IntType(),
                                                 new IntType(),
-                                                new TimestampType(
-                                                        false, TimestampKind.ROWTIME, 3))),
+                                                new TimestampType(false, TimestampKind.ROWTIME, 3)),
+                                        WatermarkParams.builder()
+                                                .emitStrategy(WatermarkEmitStrategy.ON_PERIODIC)
+                                                .alignGroupName("align-group-1")
+                                                .alignMaxDrift(Duration.ofMinutes(1))
+                                                .alignUpdateInterval(Duration.ofSeconds(1))
+                                                .sourceIdleTimeout(60000)
+                                                .build()),
+                                new WatermarkPushDownSpec(
+                                        rexBuilder.makeCall(
+                                                SqlStdOperatorTable.MINUS,
+                                                rexBuilder.makeInputRef(
+                                                        factory.createSqlType(
+                                                                SqlTypeName.TIMESTAMP, 3),
+                                                        3),
+                                                rexBuilder.makeIntervalLiteral(
+                                                        BigDecimal.valueOf(1000),
+                                                        new SqlIntervalQualifier(
+                                                                TimeUnit.SECOND,
+                                                                2,
+                                                                TimeUnit.SECOND,
+                                                                6,
+                                                                SqlParserPos.ZERO))),
+                                        rexBuilder.makeInputRef(
+                                                factory.createSqlType(SqlTypeName.TIMESTAMP, 3), 3),
+                                        5000,
+                                        RowType.of(
+                                                new BigIntType(),
+                                                new IntType(),
+                                                new IntType(),
+                                                new TimestampType(false, TimestampKind.ROWTIME, 3)),
+                                        null),
                                 new SourceWatermarkSpec(
                                         true,
                                         RowType.of(
@@ -232,7 +279,71 @@ public class DynamicTableSourceSpecSerdeTest {
                                                         put("p", "B");
                                                     }
                                                 }))));
-        return Stream.of(spec1, spec2);
+        Map<String, String> options3 = new HashMap<>();
+        options3.put("connector", TestValuesTableFactory.IDENTIFIER);
+        options3.put("disable-lookup", "true");
+        options3.put("enable-metadata-filter-push-down", "true");
+        options3.put("bounded", "false");
+        options3.put("readable-metadata", "timestamp:TIMESTAMP(3), offset:BIGINT");
+
+        final ResolvedSchema resolvedSchema3 =
+                new ResolvedSchema(
+                        Arrays.asList(
+                                Column.physical("id", DataTypes.INT()),
+                                Column.metadata(
+                                        "rowtime", DataTypes.TIMESTAMP(3), "timestamp", false),
+                                Column.metadata("offset", DataTypes.BIGINT(), null, false)),
+                        Collections.emptyList(),
+                        null,
+                        Collections.emptyList(),
+                        null);
+
+        final CatalogTable catalogTable3 =
+                CatalogTable.newBuilder()
+                        .schema(Schema.newBuilder().fromResolvedSchema(resolvedSchema3).build())
+                        .options(options3)
+                        .build();
+
+        // predicateRowType uses metadata key names (already translated from SQL aliases).
+        RowType predicateRowType3 =
+                RowType.of(
+                        new LogicalType[] {new TimestampType(3), new BigIntType()},
+                        new String[] {"timestamp", "offset"});
+
+        DynamicTableSourceSpec spec3 =
+                new DynamicTableSourceSpec(
+                        ContextResolvedTable.temporary(
+                                ObjectIdentifier.of(
+                                        TableConfigOptions.TABLE_CATALOG_NAME.defaultValue(),
+                                        TableConfigOptions.TABLE_DATABASE_NAME.defaultValue(),
+                                        "MyTableMetadata"),
+                                new ResolvedCatalogTable(catalogTable3, resolvedSchema3)),
+                        Collections.singletonList(
+                                new MetadataFilterPushDownSpec(
+                                        Arrays.asList(
+                                                // timestamp > '2024-01-01'
+                                                rexBuilder.makeCall(
+                                                        SqlStdOperatorTable.GREATER_THAN,
+                                                        rexBuilder.makeInputRef(
+                                                                factory.createSqlType(
+                                                                        SqlTypeName.TIMESTAMP, 3),
+                                                                0),
+                                                        rexBuilder.makeTimestampLiteral(
+                                                                new TimestampString(
+                                                                        "2024-01-01 00:00:00"),
+                                                                3)),
+                                                // offset >= 10
+                                                rexBuilder.makeCall(
+                                                        SqlStdOperatorTable.GREATER_THAN_OR_EQUAL,
+                                                        rexBuilder.makeInputRef(
+                                                                factory.createSqlType(
+                                                                        SqlTypeName.BIGINT),
+                                                                1),
+                                                        rexBuilder.makeExactLiteral(
+                                                                new BigDecimal(10)))),
+                                        predicateRowType3)));
+
+        return Stream.of(spec1, spec2, spec3);
     }
 
     @ParameterizedTest
@@ -265,8 +376,47 @@ public class DynamicTableSourceSpecSerdeTest {
         assertThat(actual.getContextResolvedTable()).isEqualTo(spec.getContextResolvedTable());
         assertThat(actual.getSourceAbilities()).isEqualTo(spec.getSourceAbilities());
 
-        assertThat(actual.getScanTableSource(plannerMocks.getPlannerContext().getFlinkContext()))
+        assertThat(
+                        actual.getScanTableSource(
+                                plannerMocks.getPlannerContext().getFlinkContext(),
+                                serdeCtx.getTypeFactory()))
                 .isNotNull();
+    }
+
+    @Test
+    void testMetadataFilterPushDownSpecWithEmptyPredicates() throws IOException {
+        SerdeContext serdeCtx = configuredSerdeContext();
+        MetadataFilterPushDownSpec expected =
+                new MetadataFilterPushDownSpec(
+                        List.of(),
+                        RowType.of(new LogicalType[] {new BigIntType()}, new String[] {"offset"}));
+
+        String json = toJson(serdeCtx, expected);
+        assertThat(json)
+                .doesNotContain("\"" + MetadataFilterPushDownSpec.FIELD_NAME_PREDICATES + "\"");
+        assertThat(toObject(serdeCtx, json, SourceAbilitySpec.class)).isEqualTo(expected);
+
+        String jsonWithEmpty =
+                json.replaceFirst(
+                        "\\{", "{\"" + MetadataFilterPushDownSpec.FIELD_NAME_PREDICATES + "\":[],");
+        assertThat(toObject(serdeCtx, jsonWithEmpty, SourceAbilitySpec.class)).isEqualTo(expected);
+    }
+
+    @Test
+    void testFilterPushDownSpecWithEmptyPredicates() throws IOException {
+        SerdeContext serdeCtx = configuredSerdeContext();
+        FilterPushDownSpec expected = new FilterPushDownSpec(Collections.emptyList());
+
+        String json = toJson(serdeCtx, expected);
+        assertThat(json).doesNotContain(FIELD_NAME_PREDICATES);
+        assertThat(toObject(serdeCtx, json, SourceAbilitySpec.class)).isEqualTo(expected);
+
+        assertThat(
+                        toObject(
+                                serdeCtx,
+                                "{\"type\":\"FilterPushDown\",\"predicates\":[]}",
+                                SourceAbilitySpec.class))
+                .isEqualTo(expected);
     }
 
     @Test
@@ -330,7 +480,8 @@ public class DynamicTableSourceSpecSerdeTest {
         TestDynamicTableFactory.DynamicTableSourceMock dynamicTableSource =
                 (TestDynamicTableFactory.DynamicTableSourceMock)
                         actual.getScanTableSource(
-                                plannerMocks.getPlannerContext().getFlinkContext());
+                                plannerMocks.getPlannerContext().getFlinkContext(),
+                                serdeCtx.getTypeFactory());
 
         assertThat(dynamicTableSource.password).isEqualTo("xyz");
         assertThat(
@@ -347,14 +498,16 @@ public class DynamicTableSourceSpecSerdeTest {
                                 Column.physical("b", DataTypes.INT()),
                                 Column.physical("c", DataTypes.BOOLEAN())),
                         Collections.emptyList(),
+                        null,
+                        Collections.singletonList(
+                                DefaultIndex.newIndex("idx", Collections.singletonList("a"))),
                         null);
 
         return new ResolvedCatalogTable(
-                CatalogTable.of(
-                        Schema.newBuilder().fromResolvedSchema(resolvedSchema).build(),
-                        null,
-                        Collections.emptyList(),
-                        options),
+                CatalogTable.newBuilder()
+                        .schema(Schema.newBuilder().fromResolvedSchema(resolvedSchema).build())
+                        .options(options)
+                        .build(),
                 resolvedSchema);
     }
 }

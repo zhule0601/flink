@@ -40,6 +40,7 @@ java -cp "$TARGET_DIR/TpchTestProgram.jar:$TARGET_DIR/lib/*" org.apache.flink.ta
 echo "Preparing Flink..."
 
 set_config_key "taskmanager.memory.managed.fraction" "0.55f"
+set_config_key "execution.batch.adaptive.auto-parallelism.enabled" "false"
 start_cluster
 
 ################################################################################
@@ -52,38 +53,49 @@ MODIFIED_QUERY_DIR="$TPCH_DATA_DIR/modified-query"
 EXPECTED_DIR="$TARGET_DIR/expected"
 RESULT_DIR="$TEST_DATA_DIR/result"
 INIT_SQL="$TEST_DATA_DIR/init_table.sql"
+TEMP_DIR_FOR_SUBMITTING="$TARGET_DIR/submitting"
 
 mkdir "$RESULT_DIR"
+mkdir -p "$TEMP_DIR_FOR_SUBMITTING"
 
 SOURCES_SQL=$(cat "$TPCH_DATA_DIR/source.sql")
 SOURCES_SQL=${SOURCES_SQL//\$TABLE_DIR/"$TABLE_DIR"}
 
-for i in {1..22}
-do
-    echo "Running query #$i..."
+# all queries are submitted in one SQL Client session to avoid a client startup per query
+TEMP_FILE_FOR_SUBMITTING="$TEMP_DIR_FOR_SUBMITTING/tpch.sql"
+rm -f "$TEMP_FILE_FOR_SUBMITTING"
 
-    SINK_SQL=$(cat "$TPCH_DATA_DIR/sink/q${i}.sql")
-    SINK_SQL=${SINK_SQL//\$RESULT_DIR/"$RESULT_DIR"}
-
-    cat > "$INIT_SQL" << EOF
+cat > "$TEMP_FILE_FOR_SUBMITTING" << EOF
 ${SOURCES_SQL}
-${SINK_SQL}
 SET execution.runtime-mode=batch;
 SET parallelism.default=2;
+SET table.dml-sync=true;
 EOF
+
+for i in {1..22}
+do
+    SINK_SQL=$(cat "$TPCH_DATA_DIR/sink/q${i}.sql")
+    echo "${SINK_SQL//\$RESULT_DIR/"$RESULT_DIR"}" >> "$TEMP_FILE_FOR_SUBMITTING"
 
     if [[ -e "$MODIFIED_QUERY_DIR/q$i.sql" ]]
     then
-        SQL_STATEMENT="INSERT INTO q$i $(cat "$MODIFIED_QUERY_DIR/q$i.sql")"
+        QUERY_FILE="$MODIFIED_QUERY_DIR/q$i.sql"
     else
-        SQL_STATEMENT="INSERT INTO q$i $(cat "$ORIGIN_QUERY_DIR/q$i.sql")"
+        QUERY_FILE="$ORIGIN_QUERY_DIR/q$i.sql"
     fi
 
-    JOB_ID=$("$FLINK_DIR/bin/sql-client.sh" \
-        -i "$INIT_SQL" \
-        --update "$SQL_STATEMENT" | grep "Job ID:" | sed 's/.* //g')
+    {
+        echo "INSERT INTO q$i"
+        sed -e 's/;[[:space:]]*$//' "$QUERY_FILE"
+        echo ";"
+    } >> "$TEMP_FILE_FOR_SUBMITTING"
+done
 
-    wait_job_terminal_state "$JOB_ID" "FINISHED"
+echo "Running TPC-H queries..."
+"$FLINK_DIR/bin/sql-client.sh" -f "$TEMP_FILE_FOR_SUBMITTING"
 
+for i in {1..22}
+do
+    echo "Checking result of query #$i..."
     java -cp "$TARGET_DIR/TpchTestProgram.jar" org.apache.flink.table.tpch.TpchResultComparator "$EXPECTED_DIR/q$i.csv" "$RESULT_DIR/q$i"
 done

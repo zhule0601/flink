@@ -17,3 +17,5 @@
  */
 
 export * from './is-nil';
+export * from './strong-type';
+export * from './time-axis';

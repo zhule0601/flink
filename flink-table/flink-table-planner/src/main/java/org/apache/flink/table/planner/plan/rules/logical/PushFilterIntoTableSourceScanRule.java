@@ -19,7 +19,7 @@
 package org.apache.flink.table.planner.plan.rules.logical;
 
 import org.apache.flink.table.connector.source.abilities.SupportsFilterPushDown;
-import org.apache.flink.table.planner.plan.schema.FlinkPreparingTableBase;
+import org.apache.flink.table.connector.source.abilities.SupportsReadingMetadata;
 import org.apache.flink.table.planner.plan.schema.TableSourceTable;
 import org.apache.flink.table.planner.plan.utils.FlinkRexUtil;
 
@@ -32,8 +32,9 @@ import org.apache.calcite.tools.RelBuilder;
 import scala.Tuple2;
 
 /**
- * Planner rule that tries to push a filter into a {@link LogicalTableScan}, which table is a {@link
- * TableSourceTable}. And the table source in the table is a {@link SupportsFilterPushDown}.
+ * Pushes filters from a {@link Filter} into a {@link LogicalTableScan}. Physical filters use {@link
+ * SupportsFilterPushDown}; metadata filters use {@link
+ * SupportsReadingMetadata#applyMetadataFilters}.
  */
 public class PushFilterIntoTableSourceScanRule extends PushFilterIntoSourceScanRuleBase {
     public static final PushFilterIntoTableSourceScanRule INSTANCE =
@@ -59,7 +60,7 @@ public class PushFilterIntoTableSourceScanRule extends PushFilterIntoSourceScanR
         LogicalTableScan scan = call.rel(1);
         TableSourceTable tableSourceTable = scan.getTable().unwrap(TableSourceTable.class);
 
-        return canPushdownFilter(tableSourceTable);
+        return canPushdownFilter(tableSourceTable) || canPushdownMetadataFilter(tableSourceTable);
     }
 
     @Override
@@ -74,11 +75,11 @@ public class PushFilterIntoTableSourceScanRule extends PushFilterIntoSourceScanR
             RelOptRuleCall call,
             Filter filter,
             LogicalTableScan scan,
-            FlinkPreparingTableBase relOptTable) {
+            TableSourceTable tableSourceTable) {
 
         RelBuilder relBuilder = call.builder();
         Tuple2<RexNode[], RexNode[]> extractedPredicates =
-                extractPredicates(
+                FlinkRexUtil.extractPredicates(
                         filter.getInput().getRowType().getFieldNames().toArray(new String[0]),
                         filter.getCondition(),
                         scan,
@@ -87,28 +88,28 @@ public class PushFilterIntoTableSourceScanRule extends PushFilterIntoSourceScanR
         RexNode[] convertiblePredicates = extractedPredicates._1;
         RexNode[] unconvertedPredicates = extractedPredicates._2;
         if (convertiblePredicates.length == 0) {
-            // no condition can be translated to expression
             return;
         }
 
-        Tuple2<SupportsFilterPushDown.Result, TableSourceTable> scanAfterPushdownWithResult =
-                resolveFiltersAndCreateTableSourceTable(
+        FilterPushDownResult pushDownResult =
+                classifyAndPushFilters(
                         convertiblePredicates,
-                        relOptTable.unwrap(TableSourceTable.class),
+                        unconvertedPredicates,
+                        tableSourceTable,
                         scan,
                         relBuilder);
-
-        SupportsFilterPushDown.Result result = scanAfterPushdownWithResult._1;
-        TableSourceTable tableSourceTable = scanAfterPushdownWithResult._2;
+        if (pushDownResult == null) {
+            return;
+        }
 
         LogicalTableScan newScan =
-                LogicalTableScan.create(scan.getCluster(), tableSourceTable, scan.getHints());
-        if (result.getRemainingFilters().isEmpty() && unconvertedPredicates.length == 0) {
+                LogicalTableScan.create(
+                        scan.getCluster(), pushDownResult.newTableSourceTable, scan.getHints());
+
+        if (pushDownResult.remainingRexNodes.isEmpty()) {
             call.transformTo(newScan);
         } else {
-            RexNode remainingCondition =
-                    createRemainingCondition(
-                            relBuilder, result.getRemainingFilters(), unconvertedPredicates);
+            RexNode remainingCondition = relBuilder.and(pushDownResult.remainingRexNodes);
             RexNode simplifiedRemainingCondition =
                     FlinkRexUtil.simplify(
                             relBuilder.getRexBuilder(),
